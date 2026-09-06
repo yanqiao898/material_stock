@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:sqflite/sqflite.dart';
-import 'package:path/path.dart';
+import 'package:path/path.dart' as p;
 import 'package:intl/intl.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:esc_pos_utils/esc_pos_utils.dart';
@@ -26,7 +26,7 @@ class DBHelper {
   static Database? _db;
   static Future get db async {
     if (_db != null) return _db!;
-    final path = join(await getDatabasesPath(), "stock.db");
+    final path = p.join(await getDatabasesPath(), "stock.db");
     _db = await openDatabase(
       path,
       version: 1,
@@ -148,93 +148,147 @@ class DBHelper {
 
 // ========== 蓝牙打印 ==========
 class BluetoothPrinter {
-  static FlutterBluePlus blue = FlutterBluePlus();
   static BluetoothDevice? _device;
+  static BluetoothCharacteristic? _writeChar;
 
   static Future<List<BluetoothDevice>> scanDevices({int timeoutSec = 10}) async {
     final devices = <BluetoothDevice>[];
-    blue.scanResults.listen((results) {
+    final sub = FlutterBluePlus.scanResults.listen((results) {
       for (final r in results) {
-        if (r.device.name.toString().contains('ESC') ||
-            r.device.name.toString().contains('POS') ||
-            r.device.name.toString().contains('printer') ||
-            r.device.name.toString().contains('Printer') ||
-            r.device.name.contains('蓝牙') ||
-            r.device.name.contains('打印')) {
-          if (!devices.contains(r.device)) devices.add(r.device);
+        final nm = r.device.platformName.toLowerCase();
+        if (nm.contains('esc') ||
+            nm.contains('pos') ||
+            nm.contains('printer') ||
+            nm.contains('打印') ||
+            nm.contains('蓝牙')) {
+          if (!devices.any((e) => e.remoteId == r.device.remoteId)) {
+            devices.add(r.device);
+          }
         }
       }
     });
-    await blue.startScan(timeout: Duration(seconds: timeoutSec));
-    await Future.delayed(Duration(seconds: timeoutSec));
-    await blue.stopScan();
+    try {
+      await FlutterBluePlus.startScan(timeout: Duration(seconds: timeoutSec));
+    } catch (_) {}
+    await FlutterBluePlus.isScanning.firstWhere((s) => !s, orElse: () => false);
+    await sub.cancel();
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {}
     return devices;
   }
 
   static Future<bool> connect(String name) async {
-    final devices = await blue.connectedDevices;
-    for (var d in devices) {
-      if (d.name.contains(name)) {
+    // 先看已连接设备
+    final connected = FlutterBluePlus.connectedDevices;
+    for (final d in connected) {
+      if (d.platformName.contains(name)) {
         _device = d;
-        return true;
+        await _findWriteChar(d);
+        return _writeChar != null;
+      }
+    }
+    // 扫描并连接
+    final devices = await scanDevices(timeoutSec: 8);
+    for (final d in devices) {
+      if (d.platformName.contains(name) || devices.length == 1) {
+        try {
+          await d.connect(timeout: const Duration(seconds: 15));
+          await d.connectionState
+              .firstWhere((s) => s == BluetoothConnectionState.connected)
+              .timeout(const Duration(seconds: 10));
+          _device = d;
+          await _findWriteChar(d);
+          return _writeChar != null;
+        } catch (_) {
+          continue;
+        }
       }
     }
     return false;
   }
 
-  static Future<bool> printReceipt(String orderNo, List<Map<String, dynamic>> cart,
-      double total, String remark) async {
+  static Future<void> _findWriteChar(BluetoothDevice device) async {
     try {
-      // Try to connect to printer
-      final devices = await blue.connectedDevices;
-      BluetoothDevice? printer;
-      for (var d in devices) {
-        if (d.name.toString().contains('ESC') ||
-            d.name.toString().contains('POS') ||
-            d.name.toString().contains('printer') ||
-            d.name.toString().contains('打印')) {
-          printer = d;
-          break;
+      final services = await device.discoverServices();
+      for (final s in services) {
+        for (final c in s.characteristics) {
+          if (c.properties.write || c.properties.writeWithoutResponse) {
+            _writeChar = c;
+            return;
+          }
         }
       }
-      if (printer == null && devices.isNotEmpty) printer = devices[0];
-      if (printer == null) return false;
+    } catch (_) {}
+  }
 
-      final profile = await ProfileSelector.selectProfile(
-          printer.platformChannel);
-      final generator = Generator(profile, printer.platformChannel);
+  static Future<void> _writeBytes(List<int> bytes) async {
+    if (_writeChar == null) return;
+    const chunkSize = 120;
+    for (var i = 0; i < bytes.length; i += chunkSize) {
+      final end = (i + chunkSize < bytes.length) ? i + chunkSize : bytes.length;
+      final chunk = bytes.sublist(i, end);
+      try {
+        await _writeChar!.write(chunk, withoutResponse: false);
+      } catch (_) {
+        try {
+          await _writeChar!.write(chunk, withoutResponse: true);
+        } catch (_) {}
+      }
+      await Future.delayed(const Duration(milliseconds: 30));
+    }
+  }
 
-      await generator.reset();
-      await generator.feed(2);
-      await generator.set(align: PosAlign.center);
-      await generator.boldOn();
-      await generator.text('起重工具进销存', style: PosTextSize.large);
-      await generator.boldOff();
-      await generator.text('销售小票', size: PosTextSize.doubleHeight);
-      await generator.hr();
-      await generator.set(align: PosAlign.left);
-      await generator.text('单号: $orderNo');
-      await generator.text('时间: ${DateFormat('yyyy-MM-dd HH:mm').format(DateTime.now())}');
-      if (remark.isNotEmpty) {
-        await generator.text('备注: $remark');
+  static Future<bool> printReceipt(String orderNo, List<Map<String, dynamic>> cart,
+      double total, String remark) async {
+    if (_device == null || _writeChar == null) {
+      // 尝试自动连接第一台可用打印机
+      final ok = await connect('');
+      if (!ok) return false;
+    }
+    try {
+      final profile = await CapabilityProfile.load();
+      final gen = Generator(PaperSize.mm58, profile);
+      var bytes = <int>[];
+      bytes += gen.setGlobalCodeTable('GB18030');
+
+      bytes += gen.text('起重工具进销存',
+          styles: PosStyles(
+              align: PosAlign.center,
+              bold: true,
+              height: PosTextSize.size2,
+              width: PosTextSize.size2));
+      bytes += gen.text('销售小票', styles: const PosStyles(align: PosAlign.center));
+      bytes += gen.hr(ch: '-');
+      bytes += gen.text('单号: $orderNo');
+      bytes += gen.text('时间: ${DateFormat('yyyy-MM-dd HH:mm').format(DateTime.now())}');
+      if (remark.isNotEmpty) bytes += gen.text('备注: $remark');
+      bytes += gen.hr(ch: '-');
+      bytes += gen.row([
+        PosColumn(text: '商品', width: 6, styles: const PosStyles(bold: true)),
+        PosColumn(text: '单价', width: 2, styles: const PosStyles(bold: true, align: PosAlign.right)),
+        PosColumn(text: '数量', width: 2, styles: const PosStyles(bold: true, align: PosAlign.right)),
+        PosColumn(text: '小计', width: 2, styles: const PosStyles(bold: true, align: PosAlign.right)),
+      ]);
+      bytes += gen.hr(ch: '-');
+      for (final item in cart) {
+        final price = (item["price"] as num?)?.toDouble() ?? 0;
+        final qty = (item["num"] as num?)?.toInt() ?? 0;
+        final subtotal = (item["subtotal"] as num?)?.toDouble() ?? 0;
+        bytes += gen.row([
+          PosColumn(text: '${item["name"] ?? ''}', width: 6),
+          PosColumn(text: price.toStringAsFixed(2), width: 2, styles: const PosStyles(align: PosAlign.right)),
+          PosColumn(text: 'x$qty', width: 2, styles: const PosStyles(align: PosAlign.right)),
+          PosColumn(text: subtotal.toStringAsFixed(2), width: 2, styles: const PosStyles(align: PosAlign.right)),
+        ]);
       }
-      await generator.hr();
-      await generator.text('商品',
-          styles: PosStyles.bold);
-      await generator.text('单价  数量  小计',
-          styles: PosStyles.size(PosTextSize.small));
-      await generator.hr();
-      for (var item in cart) {
-        await generator.text('${item["name"]}');
-        await generator.text(
-            '  ${item["price"].toStringAsFixed(2)}  x${item["num"]}  ${item["subtotal"].toStringAsFixed(2)}',
-            styles: PosTextSize.small);
-      }
-      await generator.hr();
-      await generator.text('合计: ¥${total.toStringAsFixed(2)}',
-          styles: PosStyles.bold);
-      await generator.feed(3);
-      await generator.cut();
+      bytes += gen.hr(ch: '-');
+      bytes += gen.text('合计: ¥${total.toStringAsFixed(2)}',
+          styles: const PosStyles(bold: true, align: PosAlign.right));
+      bytes += gen.feed(3);
+      bytes += gen.cut();
+
+      await _writeBytes(bytes);
       return true;
     } catch (e) {
       debugPrint('打印失败: $e');
@@ -388,7 +442,7 @@ class _InventoryPageState extends State<InventoryPage> {
             await DBHelper.stockIn(p['barcode'], p['stock'], '调整清零');
             await DBHelper.stockOut(p['barcode'], p['stock'], '调整清零');
             loadProducts();
-          }, icon: const Icon(Icons.refresh), label: const Text('刷新数据'))),
+          }, icon: const Icon(Icons.refresh), label: const Text('刷新数据')),
         ]),
       );
     });
@@ -564,7 +618,7 @@ class _SaleOrderPageState extends State<SaleOrderPage> {
       if (p == null) return;
     }
     setState(() {
-      cart.add({"barcode": bc, "name": p["name"], "spec": p["spec"], "price": p["price"], "num": 1, "subtotal": p["price"]});
+      cart.add({"barcode": bc, "name": p!["name"], "spec": p["spec"], "price": p["price"], "num": 1, "subtotal": p["price"]});
     });
   }
 
@@ -628,8 +682,11 @@ class _SaleOrderPageState extends State<SaleOrderPage> {
                 const SizedBox(height: 8),
                 Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
                   Text("合计：¥${total.toStringAsFixed(2)}", style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.blue)),
-                  ElevatedButton(style: ElevatedButton.styleFrom backgroundColor: Colors.blue),
-                      onPressed: submitOrder, child: const Text("保存 + 打印")),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
+                    onPressed: submitOrder,
+                    child: const Text("保存 + 打印"),
+                  ),
                 ]),
               ])),
       ]),
@@ -760,7 +817,7 @@ class _RecordsPageState extends State<RecordsPage> {
       final o = _orders[i];
       return Card(margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
           child: ListTile(
-            leading: const CircleAvatar(backgroundColor: Colors.blue[100], child: Icon(Icons.receipt_long, color: Colors.blue)),
+            leading: CircleAvatar(backgroundColor: Colors.blue[100], child: const Icon(Icons.receipt_long, color: Colors.blue)),
             title: Text(o["order_no"], style: const TextStyle(fontWeight: FontWeight.bold)),
             subtitle: Text("${DateFormat('yyyy-MM-dd HH:mm').format(DateTime.parse(o["create_at"]))} | ${o["remark"] ?? ''}"),
             trailing: Text("¥${(o["total"] as num).toStringAsFixed(2)}", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
