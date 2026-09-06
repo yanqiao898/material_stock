@@ -36,6 +36,9 @@ build/
 *.apk
 *.ap_
 *.aab
+local.properties
+key.properties
+**/GeneratedPluginRegistrant.java
 
 # iOS
 build/
