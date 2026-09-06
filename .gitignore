@@ -1,0 +1,50 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.git
+.sass-cache
+.editorconfig
+.local
+.coverage
+.robolectric
+
+# IDEs
+.idea
+.vscode
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+
+# Flutter/Dart/FlutterGen
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.build/
+/build/
+flutter_gen/
+gen_l10n_inputs_and_outputs.json
+
+# Android
+build/
+*.apk
+*.ap_
+*.aab
+
+# iOS
+build/
+Generated/
+*.xcodeproj/
+*.xcworkspace/
+Pods/
+*.xcworkspace
+*.xcodeproj
+
+# Web
+build/
