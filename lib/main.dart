@@ -506,7 +506,7 @@ class _StockOutPageState extends State<StockOutPage> {
     final num = double.tryParse(numCtrl.text.trim());
     if (num == null || num <= 0) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请输入有效数量'))); return; }
     if (product == null) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('商品不存在'))); return; }
-    if ((product!["stock"] as num) < num) { ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('库存不足，当前: ${product!["stock"]}'))); return; }
+    // 零库存销售：允许负库存出库
     setState(() => _loading = true);
     await DBHelper.stockOut(bc, num, remarkCtrl.text);
     if (mounted) {
@@ -571,9 +571,28 @@ class _SaleOrderPageState extends State<SaleOrderPage> {
   Future<void> submitOrder() async {
     if (cart.isEmpty) return;
     final orderNo = "ORD-${DateFormat('yyyyMMddHHmmss').format(DateTime.now())}";
+    // 零库存销售：自动扣减库存（允许负数）
+    var zeroStockWarning = false;
+    for (var item in cart) {
+      var prod = await DBHelper.getProduct(item["barcode"]);
+      if (prod != null) {
+        var cur = prod["stock"] as num;
+        var need = item["num"] as double;
+        if (cur < need) zeroStockWarning = true;
+        await DBHelper.stockOut(item["barcode"], need, "销售开单");
+      } else {
+        // 新商品：开单即入库（初始库存为0，销售后为负数）
+        await DBHelper.addProduct({"barcode": item["barcode"], "name": item["name"], "spec": item["spec"] ?? "", "cost": 0, "price": item["price"], "stock": 0});
+        await DBHelper.stockOut(item["barcode"], item["num"] as double, "销售开单（新商品）");
+      }
+    }
     await DBHelper.saveSaleOrder(orderNo, total, remarkCtrl.text, cart);
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("开单成功 $orderNo")));
+      if (zeroStockWarning) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("警告：存在零库存商品，已允许销售"), backgroundColor: Colors.orange));
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("开单成功 " + orderNo)));
+      }
       await BluetoothPrinter.printReceipt(orderNo, cart, total, remarkCtrl.text);
     }
     setState(() => cart.clear());
